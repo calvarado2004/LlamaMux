@@ -7,8 +7,9 @@ import (
 	"io"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
+
+	"strings"
 )
 
 type Client struct {
@@ -89,4 +90,3 @@ func (c *Client) HealthCheck() (string, error) {
 	}
 	return fmt.Sprintf("bad:%d", resp.StatusCode), nil
 }
-

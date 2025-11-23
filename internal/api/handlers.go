@@ -37,7 +37,6 @@ func NewServer(cfg config.Config) *Server {
 }
 
 // Router wiring
-
 func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/models", s.handleModels)
 	mux.HandleFunc("/v1/chat/completions", s.handleChatCompletions)
@@ -58,6 +57,45 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]interface{}{
 		"error": msg,
 	})
+}
+
+// Extract a text prompt from the last message (for SD usage)
+func promptFromMessages(msgs []ChatMessage) string {
+	if len(msgs) == 0 {
+		return ""
+	}
+	last := msgs[len(msgs)-1]
+
+	switch v := last.Content.(type) {
+	case string:
+		return v
+
+	case []interface{}:
+		// Look for the first text/input_text part
+		for _, p := range v {
+			part, ok := p.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			ptype, _ := part["type"].(string)
+			if ptype == "text" || ptype == "input_text" {
+				if txt, ok := part["text"].(string); ok && txt != "" {
+					return txt
+				}
+				if txt, ok := part["content"].(string); ok && txt != "" {
+					return txt
+				}
+			}
+		}
+
+	default:
+		// Fallback: stringify whatever it is
+		if b, err := json.Marshal(v); err == nil {
+			return string(b)
+		}
+	}
+
+	return ""
 }
 
 func toOllamaMessages(msgs []ChatMessage, ocrClient *ocr.Client) []ollama.Message {
@@ -244,6 +282,45 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// --- SPECIAL CASE: use Stable Diffusion when the "model" is the SD pseudo-model ---
+	if reqBody.Model == "stable-diffusion-webui-txt2img" {
+		prompt := promptFromMessages(reqBody.Messages)
+		if strings.TrimSpace(prompt) == "" {
+			writeError(w, http.StatusBadRequest, "prompt is empty for image generation")
+			return
+		}
+
+		// You can later make size configurable; for now we just use 512x512 here.
+		b64, err := s.sd.Txt2Img(prompt, 25, 7.0, "512x512")
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+
+		// Return as a standard chat completion with a Markdown image
+		content := "![generated image](data:image/png;base64," + b64 + ")"
+
+		resp := map[string]interface{}{
+			"id":      fmt.Sprintf("chatcmpl_%d", time.Now().UnixMilli()),
+			"object":  "chat.completion",
+			"created": NowTS(),
+			"model":   reqBody.Model,
+			"choices": []interface{}{
+				map[string]interface{}{
+					"index": 0,
+					"message": map[string]interface{}{
+						"role":    "assistant",
+						"content": content,
+					},
+					"finish_reason": "stop",
+				},
+			},
+		}
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+
+	// --- Normal path: send to Ollama as a chat completion ---
 	enriched := toOllamaMessages(reqBody.Messages, s.ocr)
 	model := reqBody.Model
 
